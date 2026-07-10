@@ -1,0 +1,6 @@
+/target
+/dist
+/data
+/.tools
+*.exe
+*.pdb
