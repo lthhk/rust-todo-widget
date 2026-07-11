@@ -5,14 +5,13 @@
 ## 构建
 
 ```powershell
-cd D:\code\codex\todo_widget
 .\build_win64.ps1
 ```
 
 生成文件：
 
 ```text
-D:\code\codex\todo_widget\dist\todo_widget.exe
+.\dist\todo_widget.exe
 ```
 
 ## 使用
