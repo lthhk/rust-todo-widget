@@ -35,7 +35,7 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             summary_weekday: 5,
-            auto_summary: true,
+            auto_summary: false,
             launch_on_startup: false,
             background_color: "#F5F7FA".to_string(),
             window_alpha: 232,
@@ -57,6 +57,7 @@ pub struct Store {
     tasks_path: PathBuf,
     settings_path: PathBuf,
     summaries_dir: PathBuf,
+    pub last_load_errors: Vec<String>,   // 新增：记录加载任务时的解析错误
 }
 
 impl Store {
@@ -73,23 +74,35 @@ impl Store {
             settings_path: data_dir.join("settings.ini"),
             summaries_dir,
             data_dir,
+            last_load_errors: Vec::new(),
         })
     }
 
-    pub fn load_tasks(&self) -> Vec<Task> {
-        let Ok(text) = fs::read_to_string(&self.tasks_path) else {
-            return Vec::new();
+    pub fn load_tasks(&mut self) -> Vec<Task> {
+        self.last_load_errors.clear();
+        let text = match fs::read_to_string(&self.tasks_path) {
+            Ok(t) => t,
+            Err(_) => return Vec::new(),
         };
 
-        text.lines()
-            .filter_map(|line| {
-                let trimmed = line.trim_end();
-                if trimmed.is_empty() || trimmed.starts_with("id\t") {
-                    return None;
+        let mut tasks = Vec::new();
+        for (line_num, line) in text.lines().enumerate() {
+            let trimmed = line.trim_end();
+            if trimmed.is_empty() || trimmed.starts_with("id\t") {
+                continue;
+            }
+            match parse_task_line(trimmed) {
+                Some(task) => tasks.push(task),
+                None => {
+                    self.last_load_errors.push(format!(
+                        "第 {} 行解析失败：{}",
+                        line_num + 1,
+                        trimmed
+                    ));
                 }
-                parse_task_line(trimmed)
-            })
-            .collect()
+            }
+        }
+        tasks
     }
 
     pub fn save_tasks(&self, tasks: &[Task]) -> io::Result<()> {
@@ -109,7 +122,11 @@ impl Store {
                 escape_field(&task.note)
             ));
         }
-        fs::write(&self.tasks_path, out)
+        // 原子写入：先写临时文件，再重命名
+        let temp_path = self.tasks_path.with_extension("tmp");
+        fs::write(&temp_path, out)?;
+        fs::rename(&temp_path, &self.tasks_path)?;
+        Ok(())
     }
 
     pub fn load_settings(&self) -> Settings {
@@ -168,7 +185,11 @@ impl Store {
             settings.window_width,
             settings.window_height
         );
-        fs::write(&self.settings_path, text)
+        // 原子写入
+        let temp_path = self.settings_path.with_extension("tmp");
+        fs::write(&temp_path, text)?;
+        fs::rename(&temp_path, &self.settings_path)?;
+        Ok(())
     }
 
     pub fn write_summary(&self, date: &str, text: &str) -> io::Result<PathBuf> {
@@ -176,6 +197,10 @@ impl Store {
         let path = self.summaries_dir.join(format!("summary-{}.md", date));
         fs::write(&path, text)?;
         Ok(path)
+    }
+
+    pub fn tasks_file_exists(&self) -> bool {
+        self.tasks_path.exists()
     }
 }
 
@@ -185,17 +210,40 @@ pub fn next_task_id(tasks: &[Task]) -> u64 {
 
 fn parse_task_line(line: &str) -> Option<Task> {
     let fields: Vec<&str> = line.split('\t').collect();
-    if fields.len() < 7 {
-        return None;
+    if fields.len() < 5 {
+        return None; // 连基本字段都不够，放弃
     }
     let id = fields[0].parse::<u64>().ok()?;
     let created_at = LocalDateTime::parse(fields[1]).ok()?;
     let due = LocalDateTime::parse(fields[2]).ok()?;
     let completed = fields[3] == "1";
-    let completed_at = if fields[4].trim().is_empty() {
-        None
-    } else {
-        LocalDateTime::parse(fields[4]).ok()
+    // 根据字段数量灵活处理
+    let (completed_at, title, note) = match fields.len() {
+        5 => (None, unescape_field(fields[4]), String::new()),  // 第5个字段可能是 title（缺少 completed_at 和 note）
+        6 => {
+            let completed_at = if fields[4].trim().is_empty() {
+                None
+            } else {
+                LocalDateTime::parse(fields[4]).ok()
+            };
+            (
+                completed_at,
+                unescape_field(fields[5]),
+                String::new(),
+            )
+        }      // 第5个字段是 completed_at，第6个是 title（缺少 note）
+        _ => {
+            let completed_at = if fields[4].trim().is_empty() {
+                None
+            } else {
+                LocalDateTime::parse(fields[4]).ok()
+            };
+            (
+                completed_at,
+                unescape_field(fields[5]),
+                unescape_field(fields[6]),
+            )
+        }
     };
     Some(Task {
         id,
@@ -203,8 +251,8 @@ fn parse_task_line(line: &str) -> Option<Task> {
         due,
         completed,
         completed_at,
-        title: unescape_field(fields[5]),
-        note: unescape_field(fields[6]),
+        title,
+        note,
     })
 }
 

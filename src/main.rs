@@ -9,6 +9,7 @@ use crate::datetime::{weekday_name, LocalDateTime};
 use crate::store::{next_task_id, Settings, Store, Task};
 use crate::summary::{generate_and_store_summary, SummaryResult};
 use crate::win32::*;
+use crate::summary::call_llm;
 use std::cmp::Reverse;
 use std::ptr::null;
 use std::sync::{Mutex, OnceLock};
@@ -59,6 +60,9 @@ const ID_SETTINGS_CANCEL: usize = 4010;
 const ID_SETTINGS_BG_PICK: usize = 4011;
 
 const ID_TEXT_CLOSE: usize = 5001;
+
+const ID_SETTINGS_TEST: usize = 4012;
+const WM_TEST_RESULT: UINT = WM_APP + 22;
 
 static APP: OnceLock<Mutex<AppState>> = OnceLock::new();
 static TODO_FORM: OnceLock<Mutex<Option<TodoFormState>>> = OnceLock::new();
@@ -134,10 +138,26 @@ struct AppState {
     fonts: Fonts,
 }
 
+struct TestResult {
+    success: bool,
+    message: String,
+}
+
 impl AppState {
-    fn new(store: Store) -> Self {
+    fn new(mut store: Store) -> Self {
         let settings = store.load_settings();
         let tasks = store.load_tasks();
+
+        // 检查文件存在且加载结果为空，可能因解析错误导致数据丢失
+        if tasks.is_empty() && store.tasks_file_exists() && !store.last_load_errors.is_empty() {
+            let msg = format!(
+                "加载任务文件时出现错误，可能导致数据丢失。\n\n错误详情：\n{}",
+                store.last_load_errors.join("\n")
+            );
+            unsafe {
+                message_box(0, "数据加载警告", &msg, MB_OK | MB_ICONERROR);
+            }
+        }
         Self {
             store,
             tasks,
@@ -591,6 +611,7 @@ unsafe extern "system" fn main_wnd_proc(
             if let Some(app) = APP.get() {
                 let mut app = app.lock().unwrap();
                 let _ = app.save_settings("已保存设置");
+                let _ = app.save_tasks("退出前保存任务");  
             }
             unsafe {
                 PostQuitMessage(0);
@@ -1855,6 +1876,22 @@ unsafe extern "system" fn settings_form_proc(
         WM_COMMAND => {
             let id = loword(wparam) as usize;
             match id {
+                ID_SETTINGS_TEST => {
+                    // 读取当前设置（克隆）
+                    let settings = {
+                        let state = SETTINGS_FORM.get().unwrap().lock().unwrap();
+                        state.as_ref().unwrap().settings.clone()
+                    };
+                    let hwnd_clone = hwnd;
+                    std::thread::spawn(move || {
+                        let result = test_llm_connection(&settings);
+                        let boxed = Box::new(result);
+                        let ptr = Box::into_raw(boxed) as isize;
+                        unsafe {
+                            PostMessageW(hwnd_clone, WM_TEST_RESULT, 0, ptr);
+                        }
+                    });
+                }
                 ID_SETTINGS_SAVE => unsafe {
                     match save_settings_from_form() {
                         Ok(()) => {
@@ -1876,6 +1913,15 @@ unsafe extern "system" fn settings_form_proc(
             }
             0
         }
+        WM_TEST_RESULT => {
+            let result = unsafe { Box::from_raw(lparam as *mut TestResult) };
+            let title = if result.success { "测试成功" } else { "测试失败" };
+            let flags = if result.success { MB_OK | MB_ICONINFORMATION } else { MB_OK | MB_ICONERROR };
+            unsafe {
+                message_box(hwnd, title, &result.message, flags);
+            }
+            0
+        }
         WM_CLOSE => {
             unsafe {
                 mark_settings_done();
@@ -1890,6 +1936,20 @@ unsafe extern "system" fn settings_form_proc(
             0
         }
         _ => unsafe { DefWindowProcW(hwnd, msg, wparam, lparam) },
+    }
+}
+
+fn test_llm_connection(settings: &Settings) -> TestResult {
+    let prompt = "你好，请回复“连接成功”";
+    match call_llm(prompt, settings) {
+        Ok(text) => TestResult {
+            success: true,
+            message: format!("连接成功，模型返回：{}", text),
+        },
+        Err(e) => TestResult {
+            success: false,
+            message: format!("连接失败：{}", e),
+        },
     }
 }
 
@@ -2076,7 +2136,7 @@ unsafe fn create_settings_controls(hwnd: HWND) {
             &settings.llm_api_key,
             128,
             312,
-            390,
+            340,
             26,
             ES_AUTOHSCROLL | ES_PASSWORD,
             ID_SETTINGS_KEY,
@@ -2084,6 +2144,17 @@ unsafe fn create_settings_controls(hwnd: HWND) {
         )
     };
     unsafe {
+        create_button(
+            hwnd,
+            hinstance,
+            "测试",
+            478,   // 128 + 340 + 10
+            312,
+            40,
+            26,
+            ID_SETTINGS_TEST,
+            font,
+        );
         create_button(
             hwnd,
             hinstance,

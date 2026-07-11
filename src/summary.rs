@@ -1,8 +1,9 @@
 use crate::datetime::LocalDateTime;
 use crate::store::{Settings, Store, Task};
-use std::fs;
+use reqwest::blocking::Client;
+use serde_json::json;
 use std::path::PathBuf;
-use std::process::Command;
+use std::time::Duration;
 
 #[derive(Clone, Debug)]
 pub struct SummaryResult {
@@ -23,8 +24,9 @@ pub fn generate_and_store_summary(
     let prompt = build_prompt(tasks, start, end);
     let llm_configured =
         !settings.llm_api_url.trim().is_empty() && !settings.llm_model.trim().is_empty();
+
     let (text, used_llm, note) = if llm_configured {
-        match call_llm(&prompt, settings, &store.data_dir) {
+        match call_llm(&prompt, settings) {
             Ok(text) if !text.trim().is_empty() => (text, true, "已使用大模型生成".to_string()),
             Ok(_) => (
                 build_local_summary(tasks, start, end, Some("大模型返回为空")),
@@ -32,14 +34,19 @@ pub fn generate_and_store_summary(
                 "大模型返回为空，已生成本地草稿".to_string(),
             ),
             Err(err) => (
-                build_local_summary(tasks, start, end, Some(&err)),
+                build_local_summary(tasks, start, end, Some("大模型调用失败，已生成本地草稿")),
                 false,
                 format!("大模型调用失败，已生成本地草稿：{}", err),
             ),
         }
     } else {
         (
-            build_local_summary(tasks, start, end, Some("尚未配置大模型 API URL 和模型名")),
+            build_local_summary(
+                tasks,
+                start,
+                end,
+                Some("尚未配置大模型 API URL 和模型名"),
+            ),
             false,
             "尚未配置大模型，已生成本地草稿".to_string(),
         )
@@ -136,88 +143,77 @@ fn build_local_summary(
     text
 }
 
-fn call_llm(prompt: &str, settings: &Settings, data_dir: &PathBuf) -> Result<String, String> {
-    fs::create_dir_all(data_dir).map_err(|err| format!("准备大模型临时目录失败：{}", err))?;
-    let stamp = LocalDateTime::now()
-        .storage_string()
-        .replace([' ', ':', '-'], "_");
-    let prompt_path = data_dir.join(format!("llm-prompt-{}.txt", stamp));
-    let out_path = data_dir.join(format!("llm-output-{}.txt", stamp));
-    let script_path = data_dir.join("call-llm.ps1");
-
-    fs::write(&prompt_path, prompt).map_err(|err| format!("写入提示词失败：{}", err))?;
-    fs::write(&script_path, POWERSHELL_SCRIPT)
-        .map_err(|err| format!("写入大模型调用脚本失败：{}", err))?;
-
-    let output = Command::new("powershell.exe")
-        .arg("-NoProfile")
-        .arg("-ExecutionPolicy")
-        .arg("Bypass")
-        .arg("-File")
-        .arg(&script_path)
-        .arg("-ApiUrl")
-        .arg(settings.llm_api_url.trim())
-        .arg("-Model")
-        .arg(settings.llm_model.trim())
-        .arg("-PromptFile")
-        .arg(&prompt_path)
-        .arg("-OutFile")
-        .arg(&out_path)
-        .env("RUST_TODO_WIDGET_LLM_KEY", settings.llm_api_key.trim())
-        .output()
-        .map_err(|err| format!("启动 PowerShell 调用大模型失败：{}", err))?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        let detail = if !stderr.is_empty() { stderr } else { stdout };
-        return Err(if detail.is_empty() {
-            "大模型命令返回失败状态".to_string()
-        } else {
-            detail
-        });
+pub fn call_llm(prompt: &str, settings: &Settings) -> Result<String, String> {
+    let url = normalize_chat_completions_url(settings.llm_api_url.trim());
+    if url.is_empty() {
+        return Err("API URL 未配置".to_string());
+    }
+    let model = settings.llm_model.trim();
+    if model.is_empty() {
+        return Err("模型名未配置".to_string());
     }
 
-    fs::read_to_string(&out_path).map_err(|err| format!("读取大模型输出失败：{}", err))
+    let client = Client::builder()
+        .timeout(Duration::from_secs(120))
+        .build()
+        .map_err(|e| format!("创建 HTTP 客户端失败：{}", e))?;
+
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert("Content-Type", "application/json".parse().unwrap());
+    if !settings.llm_api_key.trim().is_empty() {
+        let auth = format!("Bearer {}", settings.llm_api_key.trim());
+        headers.insert("Authorization", auth.parse().unwrap());
+    }
+
+    let body = json!({
+        "model": model,
+        "temperature": 0.3,
+        "messages": [
+            {"role": "system", "content": "你是一个专业、克制、准确的中文工作总结助手。"},
+            {"role": "user", "content": prompt}
+        ]
+    });
+
+    let response = client
+        .post(&url)
+        .headers(headers)
+        .json(&body)
+        .send()
+        .map_err(|e| format!("HTTP 请求失败：{}", e))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let text = response.text().unwrap_or_default();
+        return Err(format!("API 返回错误状态 {}：{}", status, text));
+    }
+
+    let json: serde_json::Value = response
+        .json()
+        .map_err(|e| format!("解析 JSON 失败：{}", e))?;
+
+    // 尝试提取 OpenAI 标准格式
+    if let Some(choices) = json.get("choices").and_then(|c| c.as_array()) {
+        if let Some(first) = choices.first() {
+            if let Some(msg) = first.get("message") {
+                if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
+                    return Ok(content.to_string());
+                }
+            }
+        }
+    }
+    // 备用兼容格式（如某些代理或本地模型）
+    if let Some(text) = json.get("output_text").and_then(|v| v.as_str()) {
+        return Ok(text.to_string());
+    }
+
+    Err("无法从响应中提取文本内容".to_string())
 }
 
-const POWERSHELL_SCRIPT: &str = r#"
-param(
-    [Parameter(Mandatory = $true)][string]$ApiUrl,
-    [Parameter(Mandatory = $true)][string]$Model,
-    [Parameter(Mandatory = $true)][string]$PromptFile,
-    [Parameter(Mandatory = $true)][string]$OutFile
-)
-
-$ErrorActionPreference = "Stop"
-[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
-
-$prompt = Get-Content -Raw -Encoding UTF8 $PromptFile
-$body = @{
-    model = $Model
-    temperature = 0.3
-    messages = @(
-        @{ role = "system"; content = "你是一个专业、克制、准确的中文工作总结助手。" },
-        @{ role = "user"; content = $prompt }
-    )
-} | ConvertTo-Json -Depth 12
-
-$headers = @{ "Content-Type" = "application/json" }
-if ($env:RUST_TODO_WIDGET_LLM_KEY) {
-    $headers["Authorization"] = "Bearer $env:RUST_TODO_WIDGET_LLM_KEY"
+fn normalize_chat_completions_url(value: &str) -> String {
+    let trimmed = value.trim().trim_end_matches('/');
+    if trimmed.ends_with("/chat/completions") {
+        trimmed.to_string()
+    } else {
+        format!("{}/chat/completions", trimmed)
+    }
 }
-
-$response = Invoke-RestMethod -Uri $ApiUrl -Method Post -Headers $headers -Body $body
-$text = $null
-if ($response.choices -and $response.choices.Count -gt 0) {
-    $text = $response.choices[0].message.content
-}
-if (-not $text -and $response.output_text) {
-    $text = $response.output_text
-}
-if (-not $text) {
-    throw "接口响应中没有可识别的文本内容"
-}
-
-Set-Content -Path $OutFile -Value $text -Encoding UTF8
-"#;

@@ -26,6 +26,7 @@ D:\code\codex\todo_widget\dist\todo_widget.exe
   - 开机自启动开关。
   - 背景色可点击选择，也可手动输入十六进制值，例如 `#F5F7FA`。
   - 窗口透明度设置，范围 `30-255`。
+  - 测试大模型是否可用
 - 右键待办：标记完成、编辑、查看备注、删除。删除会从所有记录中移除。
 - 鼠标滚轮：滚动待办列表。
 - 拖动顶部空白区域：移动小组件，松开后自动保存位置。
@@ -57,9 +58,9 @@ D:\code\codex\todo_widget\dist\todo_widget.exe
 设置里填写兼容 Chat Completions 的接口：
 
 ```text
-API URL: https://.../v1/chat/completions
+API URL: https://.../v1 或 https://.../v1/chat/completions
 模型名: 你的模型名
 API Key: 你的密钥
 ```
 
-如果未配置或调用失败，程序仍会生成本地草稿，并在小组件底部显示原因。
+如果未配置、调用失败或超过 135 秒，程序仍会生成本地草稿；调用失败详情会写入 `data\llm-error-*.txt`。调用大模型时不会弹出命令行窗口。
